@@ -7,8 +7,13 @@
  *   RTSP adds DESCRIBE/SETUP/PLAY negotiation which lets clients discover
  *   codec parameters, seek, and reconnect without prior SDP knowledge.
  *
- * Usage: rtsp_server [-p PORT] [-b KBPS] [-c h264|h265]
+ * Usage: rtsp_server [-p PORT] [-b KBPS] [-c CODEC 0:h264 1:h265]
+ *                    [-W WIDTH] [-H HEIGHT] [-f FPS]
+ *                    [-P PRESET 0:ultrafast..8:veryslow]
  *                    [-g GCS_HOST] [-G GCS_PORT] [-u STREAM_URI]
+ *                    [-s SOURCE 0:videotestsrc 1:libcamerasrc 2:v4l2src]
+ *                    [-T THREADS  encoder thread count (0=auto)]
+ *                    [-d  show local FPS overlay via fpsdisplaysink]
  *
  * Connect with:
  *   gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/uav latency=200 \
@@ -24,7 +29,6 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 
 static GMainLoop *g_loop = NULL;
@@ -50,24 +54,54 @@ int main(int argc, char *argv[])
 {
     int         port       = 8554;
     int         bitrate    = 2000;
-    const char *codec      = "h264";
+    int         codec_id   = 0;
+    int         width      = 1280;
+    int         height     = 720;
+    int         fps        = 30;
     const char *gcs_host   = NULL;   /* NULL → skip MAVLink announce */
     int         gcs_port   = 14550;
     const char *stream_uri = NULL;   /* NULL → auto-build from port */
+    int         source_id  = 0;
+    int         preset_id  = 0;
+    int         display    = 0;
+    int         threads    = 0;   /* 0 = auto */
+
+    const char *codec_enc[]    = {"x264enc",    "x265enc"};
+    const char *codec_pay[]    = {"rtph264pay", "rtph265pay"};
+    const char *codec_name[]   = {"h264",       "h265"};
+    const char *speed_preset[] = {"ultrafast", "superfast", "veryfast", "faster", "fast",
+                                   "medium", "slow", "slower", "veryslow"};
+    const char *source[]       = {"videotestsrc pattern=ball is-live=true",
+                                   "libcamerasrc ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0",
+                                   "v4l2src"};
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:b:c:g:G:u:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:b:c:W:H:f:g:G:u:s:P:T:d")) != -1) {
         switch (opt) {
         case 'p': port       = atoi(optarg); break;
         case 'b': bitrate    = atoi(optarg); break;
-        case 'c': codec      = optarg;       break;
+        case 'c': codec_id   = atoi(optarg); break;
+        case 'W': width      = atoi(optarg); break;
+        case 'H': height     = atoi(optarg); break;
+        case 'f': fps        = atoi(optarg); break;
         case 'g': gcs_host   = optarg;       break;
         case 'G': gcs_port   = atoi(optarg); break;
         case 'u': stream_uri = optarg;       break;
+        case 's': source_id  = atoi(optarg); break;
+        case 'P': preset_id  = atoi(optarg); break;
+        case 'T': threads    = atoi(optarg); break;
+        case 'd': display    = 1;            break;
         default:
             fprintf(stderr,
-                "Usage: %s [-p PORT] [-b KBPS] [-c h264|h265]"
-                " [-g GCS_HOST] [-G GCS_PORT] [-u STREAM_URI]\n", argv[0]);
+                "Usage: %s [-p PORT] [-b KBPS]"
+                " [-c CODEC 0:h264 1:h265]"
+                " [-W WIDTH] [-H HEIGHT] [-f FPS]"
+                " [-P PRESET 0:ultrafast 1:superfast 2:veryfast 3:faster 4:fast"
+                " 5:medium 6:slow 7:slower 8:veryslow]"
+                " [-g GCS_HOST] [-G GCS_PORT] [-u STREAM_URI]"
+                " [-s SOURCE 0:videotestsrc 1:libcamerasrc 2:v4l2src]"
+                " [-T THREADS (0=auto)]"
+                " [-d]\n", argv[0]);
             return 1;
         }
     }
@@ -81,23 +115,30 @@ int main(int argc, char *argv[])
      * name=pay0 is the mandatory marker that tells the server which element
      * produces RTP packets.
      */
+    int src_idx = source_id < (int)(sizeof(source)       / sizeof(source[0]))       ? source_id : 0;
+    int cid     = codec_id  < (int)(sizeof(codec_enc)    / sizeof(codec_enc[0]))    ? codec_id  : 0;
+    int pid     = preset_id < (int)(sizeof(speed_preset) / sizeof(speed_preset[0])) ? preset_id : 0;
+
     gchar *launch;
-    if (strcmp(codec, "h265") == 0) {
+    if (display) {
         launch = g_strdup_printf(
-            "( videotestsrc pattern=ball is-live=true "
-            "! video/x-raw,width=1280,height=720,framerate=30/1 "
-            "! videoconvert "
-            "! x265enc tune=zerolatency bitrate=%d key-int-max=30 speed-preset=ultrafast "
-            "! rtph265pay name=pay0 config-interval=1 pt=96 )",
-            bitrate);
+            "( %s "
+            "! video/x-raw,width=%d,height=%d,framerate=%d/1 "
+            "! videoconvert ! tee name=t "
+            "t. ! queue ! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s threads=%d "
+            "! %s name=pay0 config-interval=1 pt=96 "
+            "t. ! queue ! fpsdisplaysink video-sink=autovideosink sync=false )",
+            source[src_idx], width, height, fps,
+            codec_enc[cid], bitrate, speed_preset[pid], threads, codec_pay[cid]);
     } else {
         launch = g_strdup_printf(
-            "( videotestsrc pattern=ball is-live=true "
-            "! video/x-raw,width=1280,height=720,framerate=30/1 "
+            "( %s "
+            "! video/x-raw,width=%d,height=%d,framerate=%d/1 "
             "! videoconvert "
-            "! x264enc tune=zerolatency bitrate=%d key-int-max=30 speed-preset=ultrafast "
-            "! rtph264pay name=pay0 config-interval=1 pt=96 )",
-            bitrate);
+            "! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s threads=%d "
+            "! %s name=pay0 config-interval=1 pt=96 )",
+            source[src_idx], width, height, fps,
+            codec_enc[cid], bitrate, speed_preset[pid], threads, codec_pay[cid]);
     }
 
     gchar *port_str = g_strdup_printf("%d", port);
@@ -113,6 +154,7 @@ int main(int argc, char *argv[])
     gst_rtsp_mount_points_add_factory(mounts, "/uav", factory);
 
     g_object_unref(mounts);
+    g_print("[rtsp] Pipeline: %s\n\n", launch);
     g_free(launch);
     g_free(port_str);
 
@@ -126,8 +168,8 @@ int main(int argc, char *argv[])
 
     g_loop = g_main_loop_new(NULL, FALSE);
 
-    g_print("[rtsp] Server ready at rtsp://127.0.0.1:%d/uav (%s %d kbps)\n",
-            port, codec, bitrate);
+    g_print("[rtsp] Server ready at rtsp://127.0.0.1:%d/uav (%s %dx%d %dfps %d kbps)\n",
+            port, codec_name[cid], width, height, fps, bitrate);
     g_print("[rtsp] Connect with:  vlc rtsp://127.0.0.1:%d/uav\n", port);
 
     if (gcs_host) {
@@ -138,18 +180,17 @@ int main(int argc, char *argv[])
             auto_uri   = g_strdup_printf("rtsp://127.0.0.1:%d/uav", port);
             stream_uri = auto_uri;
         }
-        gboolean is_h265 = (strcmp(codec, "h265") == 0);
         MavlinkVideoConfig mav_cfg = {
             .gcs_host         = gcs_host,
             .gcs_port         = (guint16)gcs_port,
             .stream_uri       = stream_uri,
             .stream_type      = VIDEO_STREAM_TYPE_RTSP,
-            .encoding         = is_h265 ? VIDEO_STREAM_ENCODING_H265
-                                        : VIDEO_STREAM_ENCODING_H264,
+            .encoding         = cid == 1 ? VIDEO_STREAM_ENCODING_H265
+                                         : VIDEO_STREAM_ENCODING_H264,
             .camera_device_id = 0,
-            .fps              = 30.0f,
-            .width            = 1280,
-            .height           = 720,
+            .fps              = (gfloat)fps,
+            .width            = (guint16)width,
+            .height           = (guint16)height,
             .bitrate_kbps     = (guint32)bitrate,
         };
         if (mavlink_announce_init(&mav_cfg))

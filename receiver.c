@@ -3,7 +3,7 @@
  * buffers jitter, decodes H.264 or H.265, and either renders to screen
  * or saves directly to an MP4 file without re-encoding.
  *
- * Usage: receiver [-p PORT] [-c h264|h265] [-l LATENCY_MS] [-s OUT.mp4]
+ * Usage: receiver [-p PORT] [-c h264|h265] [-l LATENCY_MS] [-s OUT.mp4] [-d]
  */
 
 #include <gst/gst.h>
@@ -56,17 +56,19 @@ int main(int argc, char *argv[])
     const char *codec     = "h264";
     int         latency   = 200;  /* ms — trades added latency for smoothness */
     const char *save_path = NULL; /* NULL → display on screen */
+    int         display   = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:c:l:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:c:l:s:d")) != -1) {
         switch (opt) {
         case 'p': port      = atoi(optarg); break;
         case 'c': codec     = optarg;       break;
         case 'l': latency   = atoi(optarg); break;
         case 's': save_path = optarg;       break;
+        case 'd': display   = 1;            break;
         default:
             fprintf(stderr,
-                "Usage: %s [-p PORT] [-c h264|h265] [-l LATENCY_MS] [-s OUT.mp4]\n",
+                "Usage: %s [-p PORT] [-c h264|h265] [-l LATENCY_MS] [-s OUT.mp4] [-d]\n",
                 argv[0]);
             return 1;
         }
@@ -106,14 +108,17 @@ int main(int argc, char *argv[])
             "! mp4mux ! filesink location=%s",
             port, enc_name, latency, depay, parse, save_path);
     } else {
+        const char *sink = display
+            ? "fpsdisplaysink video-sink=autovideosink sync=false"
+            : "autovideosink sync=false";
         desc = g_strdup_printf(
             "udpsrc port=%d "
             "caps=\"application/x-rtp,media=video,clock-rate=90000,"
                    "encoding-name=%s,payload=96\" "
             "! rtpjitterbuffer latency=%d "
             "! %s ! %s ! %s "
-            "! videoconvert ! autovideosink sync=false",
-            port, enc_name, latency, depay, parse, decode);
+            "! videoconvert ! %s",
+            port, enc_name, latency, depay, parse, decode, sink);
     }
 
     g_print("[receiver] Pipeline: %s\n\n", desc);
