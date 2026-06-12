@@ -119,27 +119,33 @@ int main(int argc, char *argv[])
     int cid     = codec_id  < (int)(sizeof(codec_enc)    / sizeof(codec_enc[0]))    ? codec_id  : 0;
     int pid     = preset_id < (int)(sizeof(speed_preset) / sizeof(speed_preset[0])) ? preset_id : 0;
 
+    /* x265enc requires I420; libcamerasrc outputs YUYV so videoconvert needs
+     * an explicit target cap to avoid negotiating a packed format. */
+    const char *i420 = (cid == 1 && src_idx == 1) ? "! video/x-raw,format=I420 " : "";
+    gchar      *thr  = (cid == 0) ? g_strdup_printf("threads=%d ", threads) : g_strdup("");
+
     gchar *launch;
     if (display) {
         launch = g_strdup_printf(
             "( %s "
             "! video/x-raw,width=%d,height=%d,framerate=%d/1 "
-            "! videoconvert ! tee name=t "
-            "t. ! queue ! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s threads=%d "
+            "! videoconvert %s! tee name=t "
+            "t. ! queue ! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s %s"
             "! %s name=pay0 config-interval=1 pt=96 "
             "t. ! queue ! fpsdisplaysink video-sink=autovideosink sync=false )",
-            source[src_idx], width, height, fps,
-            codec_enc[cid], bitrate, speed_preset[pid], threads, codec_pay[cid]);
+            source[src_idx], width, height, fps, i420,
+            codec_enc[cid], bitrate, speed_preset[pid], thr, codec_pay[cid]);
     } else {
         launch = g_strdup_printf(
             "( %s "
             "! video/x-raw,width=%d,height=%d,framerate=%d/1 "
-            "! videoconvert "
-            "! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s threads=%d "
+            "! videoconvert %s"
+            "! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s %s"
             "! %s name=pay0 config-interval=1 pt=96 )",
-            source[src_idx], width, height, fps,
-            codec_enc[cid], bitrate, speed_preset[pid], threads, codec_pay[cid]);
+            source[src_idx], width, height, fps, i420,
+            codec_enc[cid], bitrate, speed_preset[pid], thr, codec_pay[cid]);
     }
+    g_free(thr);
 
     gchar *port_str = g_strdup_printf("%d", port);
 

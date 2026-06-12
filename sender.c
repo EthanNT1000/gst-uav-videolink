@@ -131,25 +131,31 @@ int main(int argc, char *argv[])
     int cid     = codec_id  < (int)(sizeof(codec_enc)    / sizeof(codec_enc[0]))    ? codec_id  : 0;
     int pid     = preset_id < (int)(sizeof(speed_preset) / sizeof(speed_preset[0])) ? preset_id : 0;
 
+    /* x265enc requires I420; libcamerasrc outputs YUYV so videoconvert needs
+     * an explicit target cap to avoid negotiating a packed format. */
+    const char *i420 = (cid == 1 && src_idx == 1) ? "! video/x-raw,format=I420 " : "";
+
+    gchar *thr     = (cid == 0) ? g_strdup_printf("threads=%d ", threads) : g_strdup("");
     gchar *enc_pay = g_strdup_printf(
-        "%s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s threads=%d "
+        "%s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s %s"
         "! %s config-interval=1 pt=96",
-        codec_enc[cid], bitrate, speed_preset[pid], threads, codec_pay[cid]);
+        codec_enc[cid], bitrate, speed_preset[pid], thr, codec_pay[cid]);
+    g_free(thr);
 
     gchar *desc;
     if (display) {
         desc = g_strdup_printf(
             "%s ! video/x-raw,width=%d,height=%d,framerate=%d/1 "
-            "! videoconvert ! tee name=t "
+            "! videoconvert %s! tee name=t "
             "t. ! queue ! %s ! udpsink host=%s port=%d sync=false async=false "
             "t. ! queue ! fpsdisplaysink video-sink=autovideosink sync=false",
-            source[src_idx], width, height, fps, enc_pay, host, port);
+            source[src_idx], width, height, fps, i420, enc_pay, host, port);
     } else {
         desc = g_strdup_printf(
             "%s ! video/x-raw,width=%d,height=%d,framerate=%d/1 "
-            "! videoconvert ! %s "
+            "! videoconvert %s! %s "
             "! udpsink host=%s port=%d sync=false async=false",
-            source[src_idx], width, height, fps, enc_pay, host, port);
+            source[src_idx], width, height, fps, i420, enc_pay, host, port);
     }
 
     g_print("[sender] Pipeline: %s\n\n", desc);

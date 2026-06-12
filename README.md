@@ -119,6 +119,17 @@ Both `sender` and `rtsp_server` accept `-P PRESET` to trade encoding CPU for qua
 | `7` | `slower` | |
 | `8` | `veryslow` | Offline / bench testing only |
 
+### Encoder threads (H.264 only)
+
+Pass `-T THREADS` to set the x264enc thread count. Has no effect with `-c 1`
+(H.265) because x265enc does not expose a threads property.
+
+```bash
+./build/sender -c 0 -T 4    # x264enc with 4 threads
+```
+
+`0` (default) lets x264enc choose automatically based on CPU count.
+
 ### Local preview with FPS overlay
 
 Pass `-d` to open a local display window showing the pre-encode frame rate via
