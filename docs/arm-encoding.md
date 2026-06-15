@@ -41,9 +41,24 @@ The same camera (Logitech BRIO 100) accessed two ways:
 | `libcamerasrc` (`-s 1`) | YUYV → CPU YUYV→I420 convert | ~5 |
 | `v4l2src -F 1` (`-s 2 -F 1`) | MJPEG → jpegdec → I420 | 30 |
 
-**The 5 fps was never a hardware limit — it was the wrong GStreamer element.**
+**Root cause (two layers):**
 
-**Investigation steps that confirmed root cause:**
+1. **USB bandwidth throttle (primary):** uncompressed YUYV at 1280×720@30fps
+   requires ~55 MB/s; USB 2.0 cannot sustain this. The camera firmware caps YUYV
+   delivery to 5fps at 720p. This is confirmed directly by
+   `v4l2-ctl --list-formats-ext`: the YUYV entry lists `Interval: Discrete 0.200s`
+   (5fps) at 720p, while the MJPEG entry lists `Interval: Discrete 0.033s` (30fps)
+   at the same resolution.
+
+2. **Wrong element (secondary):** `libcamerasrc` forces YUYV on USB cameras
+   regardless of what formats the camera supports. It hides the MJPEG path that
+   `v4l2src` can use, so the camera is permanently locked into the throttled mode.
+
+Switching to `v4l2src -F 1` resolves both: the camera compresses frames to MJPEG
+inside the sensor before USB transmission, `jpegdec` decodes to I420, and 30fps
+is achievable at 720p with no USB bandwidth problem.
+
+**Investigation steps:**
 
 | Test | Result |
 | --- | --- |
@@ -51,8 +66,9 @@ The same camera (Logitech BRIO 100) accessed two ways:
 | Force `format=I420` via libcamerasrc | `not-negotiated` |
 | No caps (libcamerasrc default) | `YUY2 @ 1920×1080` |
 | Display-only (`autovideosink`) | GPU converts YUY2 — no CPU bottleneck for display, only encoding |
-| Lower resolution (`-W 640 -H 480`) | 30 fps — confirmed bottleneck is YUYV→I420 pixel count |
-| Switch to `v4l2src -F 1` | 30 fps at 720p — MJPEG path bypasses conversion entirely |
+| Lower resolution (`-W 640 -H 480`) | 30 fps — YUYV 480p fits USB bandwidth (camera lists 480p@30fps for YUYV) |
+| `v4l2-ctl --list-formats-ext` | YUYV 720p capped at 5fps in camera descriptor; MJPEG 720p lists 30fps |
+| Switch to `v4l2src -F 1` | 30 fps at 720p — MJPEG bypasses USB throttle and YUYV→I420 conversion |
 
 **Measured fps (x264enc ultrafast, `performance` governor):**
 

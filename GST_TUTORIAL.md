@@ -12,6 +12,7 @@ Estimated time: 5–6 hours reading + hands-on.
    - 2.7 [Branching with tee](#27-branching-with-tee)
    - 2.8 [Common caps types](#28-common-caps-types)
    - 2.9 [Transcoding and format conversion](#29-transcoding-and-format-conversion)
+   - 2.10 [Inspecting camera capabilities with v4l2-ctl](#210-inspecting-camera-capabilities-with-v4l2-ctl)
 3. [H.264 and H.265 Encoding](#3-h264-and-h265-encoding)
 4. [RTP — Real-time Transport Protocol](#4-rtp--real-time-transport-protocol)
 5. [RTSP — Real-Time Streaming Protocol](#5-rtsp--real-time-streaming-protocol)
@@ -461,6 +462,101 @@ worthwhile trade.
 
 MJPEG direct only makes sense on a gigabit LAN or USB-tethered link where
 bandwidth is not a constraint and you want to eliminate encoder latency.
+
+### 2.10 Inspecting camera capabilities with v4l2-ctl
+
+Before building a pipeline for a USB camera, query what the camera actually
+supports. Requesting a format or resolution the camera cannot deliver causes
+a `not-negotiated` error with no helpful message.
+
+#### List devices
+
+```bash
+# Human-readable device names and their /dev/video* nodes
+v4l2-ctl --list-devices
+
+# Quick list of all video nodes
+ls /dev/video*
+```
+
+#### List formats, resolutions, and framerates
+
+```bash
+v4l2-ctl --list-formats-ext
+```
+
+Abbreviated example output:
+
+```
+[0]: 'YUYV' (YUYV 4:2:2)
+        Size: Discrete 640x480
+                Interval: Discrete 0.033s (30.000 fps)
+        Size: Discrete 1280x720
+                Interval: Discrete 0.200s (5.000 fps)
+[1]: 'MJPG' (Motion-JPEG, compressed)
+        Size: Discrete 640x480
+                Interval: Discrete 0.033s (30.000 fps)
+        Size: Discrete 1280x720
+                Interval: Discrete 0.033s (30.000 fps)
+```
+
+**Reading the output:**
+
+| Field | Meaning |
+| --- | --- |
+| `[0]: 'YUYV'` | Format index and fourcc code |
+| `Size: Discrete 1280x720` | Exact resolution this format supports |
+| `Interval: Discrete 0.033s (30.000 fps)` | One fixed framerate the camera accepts |
+
+**Discrete** means only these exact values are accepted — you cannot request
+25fps if the camera lists only 30fps and 24fps. The driver may silently round
+to the nearest listed interval, so the pipeline appears to work but delivers
+the wrong rate.
+
+The opposite is **Stepwise**, which means any framerate within a min/max range
+is accepted. Most USB webcams use Discrete.
+
+#### Why YUYV caps out at 5fps at 720p
+
+YUYV is uncompressed: 2 bytes per pixel. At 1280×720@30fps:
+
+```
+1280 × 720 × 2 bytes × 30 fps ≈ 55 MB/s
+```
+
+USB 2.0's practical throughput is ~40–60 MB/s. The camera firmware throttles
+YUYV to 5fps at 720p because it cannot push uncompressed data that fast through
+the bus. This limit is embedded in the camera's USB descriptor — it is visible
+directly in `v4l2-ctl --list-formats-ext` as `Interval: Discrete 0.200s` at
+720p for the YUYV entry.
+
+MJPEG compresses each frame inside the camera before sending over USB, so
+720p30 fits in ~2–5 MB/s — well within USB 2.0.
+
+#### Decision table from v4l2-ctl output
+
+| Situation | Flag to use |
+| --- | --- |
+| `MJPG` listed at target resolution and fps | `-F 1` (MJPEG) |
+| Only `YUYV` listed at target resolution | `-F 0` (raw) — verify fps is achievable |
+| YUYV fps too low at target resolution | Lower resolution or switch to MJPEG |
+
+#### Just format names (no resolutions)
+
+```bash
+v4l2-ctl --list-formats
+```
+
+Faster scan when you only need to know if MJPG is available at all.
+
+#### GStreamer's own camera probe
+
+```bash
+gst-device-monitor-1.0 Video/Source
+```
+
+Outputs caps in GStreamer syntax, ready to paste into a pipeline caps filter.
+More verbose than v4l2-ctl but directly usable in `gst-launch-1.0` pipelines.
 
 ---
 
