@@ -95,13 +95,25 @@ Both `sender` and `rtsp_server` accept `-s SOURCE`:
 | `-s` | Source |
 | --- | --- |
 | `0` (default) | `videotestsrc` — animated test pattern, no hardware needed |
-| `1` | `libcamerasrc` — Raspberry Pi CSI camera (libcamera stack) |
+| `1` | `libcamerasrc` — CSI camera via MIPI CSI-2 (libcamera stack; forces YUYV on USB cameras — use `-s 2` for USB) |
 | `2` | `v4l2src` — USB or V4L2 camera (`/dev/video0`) |
 
 ```bash
-./build/sender -s 1 -h 192.168.1.1 -p 5600    # CSI camera
-./build/sender -s 2 -h 192.168.1.1 -p 5600    # USB camera
+./build/sender -s 1 -h 192.168.1.1 -p 5600         # CSI camera
+./build/sender -s 2 -h 192.168.1.1 -p 5600         # USB camera, raw YUYV
+./build/sender -s 2 -F 1 -h 192.168.1.1 -p 5600   # USB camera, MJPEG
 ```
+
+Pass `-F INPUT_FORMAT` to select the input caps for v4l2src (`-s 2`). Ignored
+for other sources.
+
+| `-F` | Caps | Use case |
+| --- | --- | --- |
+| `0` (default) | `video/x-raw` | YUYV cameras, or low-res modes |
+| `1` | `image/jpeg` + `jpegdec` | MJPEG cameras (most modern webcams at 720p+) |
+
+Check what your camera supports with `v4l2-ctl --list-formats-ext` — if it
+lists `MJPG`, use `-F 1`.
 
 ### Speed preset
 
@@ -212,15 +224,10 @@ keeps up at 30 fps.
 
 **Workaround:** use `-W 640 -H 480` for 30 fps with the CSI camera.
 
-**Next step for 720p:** check if the Pi 5 GPU can accelerate the colour
-conversion:
-
-```bash
-gst-inspect-1.0 glcolorconvert
-```
-
-If available, replace `videoconvert` with
-`glupload ! glcolorconvert ! gldownload` to offload YUYV→I420 to the GPU.
+**Pi 5 has no hardware H.264 encoder** — Pi 5 (BCM2712 / VideoCore VII)
+dropped the MMAL encoder that Pi 4 had, and V4L2 M2M encode is not yet
+available. Software x264enc is the only option, so the YUYV→I420 CPU
+bottleneck cannot be bypassed. Use `-W 640 -H 480` for 30 fps.
 
 ### Measuring pipeline latency
 

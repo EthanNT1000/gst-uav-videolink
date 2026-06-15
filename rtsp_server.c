@@ -12,6 +12,7 @@
  *                    [-P PRESET 0:ultrafast..8:veryslow]
  *                    [-g GCS_HOST] [-G GCS_PORT] [-u STREAM_URI]
  *                    [-s SOURCE 0:videotestsrc 1:libcamerasrc 2:v4l2src]
+ *                    [-F INPUT_FORMAT 0:raw(YUYV) 1:mjpeg  (v4l2src only)]
  *                    [-T THREADS  encoder thread count (0=auto)]
  *                    [-d  show local FPS overlay via fpsdisplaysink]
  *
@@ -63,8 +64,9 @@ int main(int argc, char *argv[])
     const char *stream_uri = NULL;   /* NULL → auto-build from port */
     int         source_id  = 0;
     int         preset_id  = 0;
+    int         input_fmt  = 0;  /* 0=raw(video/x-raw)  1=mjpeg(image/jpeg) */
     int         display    = 0;
-    int         threads    = 0;   /* 0 = auto */
+    int         threads    = 0;  /* 0 = auto */
 
     const char *codec_enc[]    = {"x264enc",    "x265enc"};
     const char *codec_pay[]    = {"rtph264pay", "rtph265pay"};
@@ -76,7 +78,7 @@ int main(int argc, char *argv[])
                                    "v4l2src"};
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:b:c:W:H:f:g:G:u:s:P:T:d")) != -1) {
+    while ((opt = getopt(argc, argv, "p:b:c:W:H:f:g:G:u:s:P:F:T:d")) != -1) {
         switch (opt) {
         case 'p': port       = atoi(optarg); break;
         case 'b': bitrate    = atoi(optarg); break;
@@ -89,6 +91,7 @@ int main(int argc, char *argv[])
         case 'u': stream_uri = optarg;       break;
         case 's': source_id  = atoi(optarg); break;
         case 'P': preset_id  = atoi(optarg); break;
+        case 'F': input_fmt  = atoi(optarg); break;
         case 'T': threads    = atoi(optarg); break;
         case 'd': display    = 1;            break;
         default:
@@ -100,6 +103,7 @@ int main(int argc, char *argv[])
                 " 5:medium 6:slow 7:slower 8:veryslow]"
                 " [-g GCS_HOST] [-G GCS_PORT] [-u STREAM_URI]"
                 " [-s SOURCE 0:videotestsrc 1:libcamerasrc 2:v4l2src]"
+                " [-F INPUT_FORMAT 0:raw 1:mjpeg (v4l2src only)]"
                 " [-T THREADS (0=auto)]"
                 " [-d]\n", argv[0]);
             return 1;
@@ -119,32 +123,48 @@ int main(int argc, char *argv[])
     int cid     = codec_id  < (int)(sizeof(codec_enc)    / sizeof(codec_enc[0]))    ? codec_id  : 0;
     int pid     = preset_id < (int)(sizeof(speed_preset) / sizeof(speed_preset[0])) ? preset_id : 0;
 
-    /* x265enc requires I420; libcamerasrc outputs YUYV so videoconvert needs
-     * an explicit target cap to avoid negotiating a packed format. */
-    const char *i420 = (cid == 1 && src_idx == 1) ? "! video/x-raw,format=I420 " : "";
-    gchar      *thr  = (cid == 0) ? g_strdup_printf("threads=%d ", threads) : g_strdup("");
+    /* libcamerasrc outputs YUYV; both x264enc and x265enc need I420.
+     * Make the conversion target explicit so videoconvert never settles on
+     * a packed format regardless of codec. */
+    const char *i420 = (src_idx == 1) ? "! video/x-raw,format=I420 " : "";
+
+    /* Build source fragment.
+     * -F 1 (mjpeg): v4l2src outputs MJPEG — negotiate image/jpeg caps then
+     *               decode with jpegdec before the rest of the pipeline.
+     * -F 0 (raw, default): all other sources output video/x-raw directly. */
+    gchar *src_frag;
+    if (src_idx == 2 && input_fmt == 1) {
+        src_frag = g_strdup_printf(
+            "v4l2src ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! jpegdec",
+            width, height, fps);
+    } else {
+        src_frag = g_strdup_printf(
+            "%s ! video/x-raw,width=%d,height=%d,framerate=%d/1",
+            source[src_idx], width, height, fps);
+    }
+
+    gchar *thr = (cid == 0) ? g_strdup_printf("threads=%d ", threads) : g_strdup("");
 
     gchar *launch;
     if (display) {
         launch = g_strdup_printf(
             "( %s "
-            "! video/x-raw,width=%d,height=%d,framerate=%d/1 "
             "! videoconvert %s! tee name=t "
             "t. ! queue ! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s %s"
             "! %s name=pay0 config-interval=1 pt=96 "
             "t. ! queue ! fpsdisplaysink video-sink=autovideosink sync=false )",
-            source[src_idx], width, height, fps, i420,
+            src_frag, i420,
             codec_enc[cid], bitrate, speed_preset[pid], thr, codec_pay[cid]);
     } else {
         launch = g_strdup_printf(
             "( %s "
-            "! video/x-raw,width=%d,height=%d,framerate=%d/1 "
             "! videoconvert %s"
             "! %s tune=zerolatency bitrate=%d key-int-max=30 speed-preset=%s %s"
             "! %s name=pay0 config-interval=1 pt=96 )",
-            source[src_idx], width, height, fps, i420,
+            src_frag, i420,
             codec_enc[cid], bitrate, speed_preset[pid], thr, codec_pay[cid]);
     }
+    g_free(src_frag);
     g_free(thr);
 
     gchar *port_str = g_strdup_printf("%d", port);

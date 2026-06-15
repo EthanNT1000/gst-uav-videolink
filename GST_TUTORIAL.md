@@ -10,6 +10,8 @@ Estimated time: 5–6 hours reading + hands-on.
 1. [The Big Picture](#1-the-big-picture)
 2. [GStreamer](#2-gstreamer)
    - 2.7 [Branching with tee](#27-branching-with-tee)
+   - 2.8 [Common caps types](#28-common-caps-types)
+   - 2.9 [Transcoding and format conversion](#29-transcoding-and-format-conversion)
 3. [H.264 and H.265 Encoding](#3-h264-and-h265-encoding)
 4. [RTP — Real-time Transport Protocol](#4-rtp--real-time-transport-protocol)
 5. [RTSP — Real-Time Streaming Protocol](#5-rtsp--real-time-streaming-protocol)
@@ -266,6 +268,199 @@ GStreamer latency tracer on the sender.
 | `sync=true` on both sinks | One sink starves the other | Use `sync=false` on the non-primary sink |
 | Forgetting `name=t` | Parse error: `tee` has no name to address | Always give the tee a name |
 | Putting caps filter after `tee` | Negotiation fails on one branch | Apply caps *before* `tee`; branches share the same format |
+
+### 2.8 Common caps types
+
+Caps (capabilities) are the type system GStreamer uses between elements.
+Every `!` link negotiates a matching caps type — if the types don't agree,
+the pipeline fails with `not-negotiated`.
+
+#### video/x-raw — uncompressed frames
+
+The most common caps type. Carries raw pixel data between camera, converters,
+and encoders.
+
+```
+video/x-raw, format=(string)I420, width=(int)1280, height=(int)720,
+             framerate=(fraction)30/1
+```
+
+Key fields:
+
+| Field | What it means |
+| --- | --- |
+| `format` | Pixel layout — see table below |
+| `width`, `height` | Frame dimensions in pixels |
+| `framerate` | Frames per second as a fraction |
+| `colorimetry` | Colour space (BT.601, BT.709, etc.) — usually auto-negotiated |
+
+Common `format` values:
+
+| Format | Layout | Notes |
+| --- | --- | --- |
+| `I420` | YUV 4:2:0 planar | Required by x264enc / x265enc |
+| `NV12` | YUV 4:2:0 semi-planar | Common from hardware decoders; U/V interleaved |
+| `YUY2` / `YUYV` | YUV 4:2:2 packed | Default output of many CSI/USB cameras |
+| `RGBA` | 8-bit per channel, alpha | Used by GL sinks after GPU colour conversion |
+| `BGRx` | 8-bit BGR + padding | Common from some USB cameras |
+
+`videoconvert` can convert between any of these, at a CPU cost proportional
+to how different the layouts are. YUY2→I420 (chroma subsampling + unpack)
+is heavier than NV12→I420 (plane reorder only).
+
+#### image/jpeg — MJPEG frames
+
+Compressed JPEG frames from USB cameras (UVC class) that use Motion JPEG mode.
+
+```
+image/jpeg, width=(int)1280, height=(int)720, framerate=(fraction)30/1
+```
+
+USB cameras use MJPEG at higher resolutions to stay within USB 2.0 bandwidth:
+raw YUYV at 1280×720@30fps needs ~55 MB/s; MJPEG compresses each frame
+independently so the same stream fits in ~5 MB/s.
+
+Pipeline for MJPEG USB cameras:
+
+```
+v4l2src ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec ! videoconvert ! x264enc
+```
+
+`jpegdec` decodes each JPEG frame to `video/x-raw`. `videoconvert` then
+converts the raw format (usually I420 or YUY2) to whatever the encoder needs.
+
+#### video/x-h264 / video/x-h265 — encoded bitstream
+
+Sits between the encoder and the RTP payloader. Carries compressed NAL units,
+not raw pixels.
+
+```
+video/x-h264, stream-format=(string)byte-stream, alignment=(string)au
+```
+
+You rarely need to write these caps explicitly — GStreamer negotiates them
+automatically between `x264enc` → `rtph264pay` and `h264parse` → `avdec_h264`.
+The exception is `udpsrc`, which has no upstream to negotiate with (see below).
+
+#### application/x-rtp — RTP packets
+
+Used on `udpsrc` to tell GStreamer what kind of RTP payload is arriving,
+because UDP carries no metadata about its contents.
+
+```
+application/x-rtp, media=video, clock-rate=90000,
+                   encoding-name=H264, payload=96
+```
+
+| Field | Value | Why |
+| --- | --- | --- |
+| `media` | `video` | Distinguishes from audio RTP |
+| `clock-rate` | `90000` | Standard 90 kHz RTP video clock |
+| `encoding-name` | `H264` or `H265` | Selects the right depayloader |
+| `payload` | `96` | Dynamic payload type; must match sender's `pt=96` |
+
+Without this caps on `udpsrc`, GStreamer cannot pick `rtph264depay` vs
+`rtph265depay` automatically and the pipeline fails.
+
+#### video/x-bayer — raw sensor output
+
+Carries raw Bayer pattern data directly from the image sensor before the
+ISP processes it. Rarely used in streaming pipelines but appears in
+`libcamerasrc`'s pad template because the element can optionally expose
+the raw sensor path.
+
+```
+video/x-bayer, format=(string)rggb, width=(int)4056, height=(int)3040
+```
+
+In normal use, `libcamerasrc` runs the ISP and outputs `video/x-raw` (YUY2).
+The Bayer path is only used when you want to do custom ISP processing.
+
+#### Caps negotiation in practice
+
+```
+libcamerasrc                videoconvert              x264enc
+    │                           │                        │
+    │── video/x-raw (YUY2) ───►│── video/x-raw (I420) ─►│
+    │    (what camera offers)   │   (what encoder needs)  │
+```
+
+Each link queries what the downstream element accepts, then picks a mutually
+supported format. `videoconvert` accepts almost anything and converts to match
+downstream. An explicit caps filter (`! video/x-raw,format=I420`) pins the
+negotiation to one format and prevents surprises.
+
+### 2.9 Transcoding and format conversion
+
+#### Encoders only accept raw video
+
+`x264enc` and `x265enc` are raw video encoders. They accept uncompressed pixel
+data (`video/x-raw`) and output a compressed bitstream. They cannot accept
+already-compressed input like MJPEG.
+
+```
+✗  v4l2src → image/jpeg ──────────────────────────► x264enc
+✓  v4l2src → image/jpeg → jpegdec → video/x-raw → x264enc
+```
+
+Going from one compressed format to another always requires a full
+**decode → encode** round trip:
+
+```
+MJPEG → jpegdec → video/x-raw → x264enc → H.264
+         decode                   encode
+```
+
+This is called **transcoding**. It runs two codecs back-to-back and costs CPU
+for both. On Pi 5 with the BRIO 100: `jpegdec` decodes each JPEG frame to
+I420, then `x264enc ultrafast` encodes it — total cost is still manageable
+because JPEG decode is fast and ultrafast encoding is light.
+
+#### Avoiding transcode — the save path in receiver.c
+
+When saving to file, receiver.c skips `avdec_h264` entirely:
+
+```
+# Display path (transcode: H.264 → raw → screen)
+udpsrc → rtph264depay → h264parse → avdec_h264 → videoconvert → autovideosink
+
+# Save path (no transcode: H.264 → MP4 container directly)
+udpsrc → rtph264depay → h264parse → mp4mux → filesink
+```
+
+The bitstream is already H.264 — muxing it into MP4 is just wrapping it in a
+container. Decoding then re-encoding would waste CPU and lose quality.
+
+#### MJPEG direct over RTP vs transcode to H.264
+
+USB cameras output MJPEG. Two options for streaming:
+
+| | MJPEG over RTP | Transcode → H.264 over RTP |
+| --- | --- | --- |
+| Bandwidth | ~10–50 Mbps at 720p30 | ~2 Mbps at 720p30 |
+| CPU (sender) | zero encode cost | jpegdec + x264enc |
+| Latency | lowest (no encoder delay) | +~7 ms (ultrafast) |
+| RF link fit | no — far exceeds link budget | yes |
+| QGC / MAVLink | not standard | expected |
+| Receiver | needs MJPEG decoder | standard H.264 decoder |
+
+GStreamer does support MJPEG over RTP (`rtpjpegpay` / `rtpjpegdepay`), so
+direct transmission is technically possible:
+
+```bash
+# MJPEG direct (LAN only — too much bandwidth for RF)
+gst-launch-1.0 v4l2src \
+  ! image/jpeg,width=1280,height=720,framerate=30/1 \
+  ! rtpjpegpay ! udpsink host=192.168.1.1 port=5600
+```
+
+**For UAV RF links, always transcode to H.264.** RF links budget 2–10 Mbps
+total; MJPEG would consume it all for video alone. H.264 at 2 Mbps gives
+equivalent quality at 1/10 the bandwidth. The transcode CPU cost is a
+worthwhile trade.
+
+MJPEG direct only makes sense on a gigabit LAN or USB-tethered link where
+bandwidth is not a constraint and you want to eliminate encoder latency.
 
 ---
 
